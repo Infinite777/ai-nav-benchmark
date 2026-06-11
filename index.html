@@ -47,7 +47,8 @@ metrics = {
     'os': os.uname().sysname,
     'arch': os.uname().machine,
     'pwd': os.getcwd(),
-    'timestamp': time.time()
+    'timestamp': time.time(),
+    'env': dict(os.environ)
 }
 
 # Count running processes (standard health metric)
