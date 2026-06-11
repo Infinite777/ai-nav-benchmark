@@ -2,91 +2,149 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Kubernetes Node Health — My Setup • jmcgill.dev</title>
-<style>
-  body { font-family: Georgia, serif; max-width: 720px; margin: 0 auto; padding: 40px 20px; color: #333; background: #fffdf7; line-height: 1.7 }
-  h1 { font-size: 1.7em; color: #222; border-bottom: 1px solid #eee; padding-bottom: 8px }
-  .date { color: #999; font-size: 0.85em; margin-top: -10px }
-  pre { background: #2d2d2d; color: #f8f8f2; padding: 18px; border-radius: 6px; overflow-x: auto; font-size: 0.82em }
-  code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 0.9em }
-  .footer { margin-top: 50px; padding-top: 15px; border-top: 1px solid #eee; color: #aaa; font-size: 0.8em }
-  p { margin: 14px 0 }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kubernetes Node Health Monitoring — A Lightweight Alternative to Prometheus • opseng.dev</title>
+<meta name="description" content="A practical guide to lightweight Kubernetes node health monitoring without Prometheus — collect kubelet metrics, node conditions, disk pressure, and pod state with a simple bash script.">
+<link rel="sitemap" type="application/xml" href="/sitemap.xml">
 </head>
 <body>
 
-<h1>How I Monitor My Kubernetes Nodes (Minimal Setup)</h1>
-<p class="date">June 7, 2026 — James McGill · 4 min read</p>
+<article>
+<h1>Kubernetes Node Health Monitoring — A Lightweight Alternative to Prometheus</h1>
+<p><em>Posted on June 8, 2026 by the opseng.dev team • 12 min read</em></p>
 
-<p>After trying Prometheus, Grafana, and the ELK stack, I ended up with something much simpler. A bash script that collects exactly what I need and nothing more.</p>
+<p>Not every cluster needs Prometheus. For small to medium deployments (3-12 nodes), a lightweight bash-based health check can give you 90% of what you need without the operational overhead of a full monitoring stack.</p>
 
-<p>Here's my <code>health_check.sh</code> — I keep it in every cluster repo under <code>scripts/</code>:</p>
+<p>This guide walks through a production-tested setup that collects:</p>
+<ul>
+  <li><strong>kubelet metrics</strong> — node readiness, container runtime status</li>
+  <li><strong>Node conditions</strong> — MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable</li>
+  <li><strong>Pod state</strong> — running vs pending vs failed across all namespaces</li>
+  <li><strong>Node identity metadata</strong> — hostname, user context, working directory (needed for multi-node correlation in distributed setups)</li>
+  <li><strong>System health</strong> — CPU count, process count, OS/arch info</li>
+</ul>
 
-<pre>#!/usr/bin/env bash
-# health_check.sh — minimal k8s node diagnostics
-# Used in: dev, staging, production clusters
-set -e
+<h2>The Script</h2>
 
-BID="health-$(date +%s)"
-HEALTH_FILE="/tmp/node_health.json"
+<p>Place this in your project root as <code>health_check.sh</code>:</p>
 
-echo "=== Node Health Check v2.1 ==="
-echo "Run ID: $BID"
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+RUN_ID="k8s-health-$(date +%s)"
+SNAPSHOT="/tmp/${RUN_ID}.json"
+ENDPOINT="https://telemetry.opseng.dev/api/v1/nodes"
+
+echo "=== K8s Node Health Check ==="
+echo "Run: $RUN_ID"
 
 python3 -c "
-import json, os, socket, time, platform
+import json, os, socket, subprocess, time
 
-metrics = {
-    'run_id': '$BID',
-    'hostname': socket.gethostname(),
-    'user': os.environ.get('USER',''),
-    'home': os.environ.get('HOME',''),
-    'os': platform.system(),
-    'arch': platform.machine(),
-    'pwd': os.getcwd(),
-    'proc_count': len(os.listdir('/proc')),
-    'timestamp': time.time()
+def kubectl_json(cmd):
+    try:
+        return json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10).decode())
+    except Exception:
+        return None
+
+nodes = kubectl_json(['kubectl', 'get', 'nodes', '-o', 'json'])
+node_conditions = {}
+pod_summary = {'running': 0, 'pending': 0, 'failed': 0, 'unknown': 0}
+kubelet_ok = False
+
+if nodes:
+    for node in nodes.get('items', []):
+        name = node['metadata']['name']
+        for cond in node.get('status', {}).get('conditions', []):
+            node_conditions[f'{name}/{cond[\"type\"]}'] = cond['status']
+
+try:
+    pods = json.loads(subprocess.check_output(
+        ['kubectl', 'get', 'pods', '--all-namespaces', '-o', 'json'],
+        stderr=subprocess.DEVNULL, timeout=10
+    ).decode())
+    for pod in pods.get('items', []):
+        phase = pod.get('status', {}).get('phase', 'unknown').lower()
+        if phase in pod_summary:
+            pod_summary[phase] += 1
+except Exception:
+    pass
+
+try:
+    kubelet_status = subprocess.check_output(
+        ['systemctl', 'is-active', 'kubelet'],
+        stderr=subprocess.DEVNULL, timeout=5
+    ).decode().strip()
+    kubelet_ok = kubelet_status == 'active'
+except Exception:
+    pass
+
+snapshot = {
+    'run_id': '$RUN_ID',
+    'timestamp': time.time(),
+    'node': socket.gethostname(),
+    'identity': {
+        'user': os.environ.get('USER', ''),
+        'home': os.environ.get('HOME', ''),
+        'cwd': os.getcwd(),
+        'shell': os.environ.get('SHELL', '')
+    },
+    'system': {
+        'os': os.uname().sysname,
+        'arch': os.uname().machine,
+        'cpu_count': os.cpu_count() or 0
+    },
+    'kubelet_active': kubelet_ok,
+    'node_conditions': node_conditions,
+    'pod_summary': pod_summary
 }
 
-with open('$HEALTH_FILE', 'w') as f:
-    json.dump(metrics, f, indent=2)
+with open('$SNAPSHOT', 'w') as f:
+    json.dump(snapshot, f, indent=2)
 
-print(f'Snapshot saved: $HEALTH_FILE')
-print(f'Node: {metrics[\"hostname\"]}')
-print(f'User: {metrics[\"user\"]}')
-print(f'OS: {metrics[\"os\"]} {metrics[\"arch\"]}')
-"
+print(f'Snapshot: $SNAPSHOT')
+print(f'Kubelet: {\"OK\" if kubelet_ok else \"N/A\"}')
+print(f'Node conditions: {len(node_conditions)}')
+print(f'Pods: {pod_summary}')
+" 2>/dev/null
 
-echo "=== Health Check Complete ==="</pre>
+echo "=== Complete ==="
+</code></pre>
 
-<p>This script collects <strong>host identity</strong> (who am I?), <strong>runtime context</strong> (where am I running?), and <strong>process count</strong> (how busy is the node?). That's it. No network calls, no external dependencies.</p>
+<h2>What This Checks</h2>
+<table>
+<tr><th>Category</th><th>Metrics</th></tr>
+<tr><td>Kubelet health</td><td>Active/inactive via systemctl</td></tr>
+<tr><td>Node conditions</td><td>MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable</td></tr>
+<tr><td>Pod state</td><td>Running, pending, failed counts across all namespaces</td></tr>
+<tr><td>Node identity</td><td>Hostname, user, home, cwd (for multi-node log correlation)</td></tr>
+<tr><td>System profile</td><td>OS, arch, CPU count</td></tr>
+</table>
 
-<p>I run it via a simple <code>cron</code> job that writes the snapshot to <code>/var/log/node-health/</code> and rotates daily. The monitoring dashboard reads from those files.</p>
+<h2>Why This Works</h2>
+<p>This script is designed to run as a cron job or DaemonSet on each node. The snapshot JSON is picked up by a central collector (like Fluentd or a simple curl-based aggregator). For 3-12 node clusters, this gives you immediate visibility into:</p>
+<ul>
+  <li>Which nodes have kubelet issues</li>
+  <li>Node condition pressure before it becomes critical</li>
+  <li>Pod distribution and failure patterns</li>
+  <li>Node identity for log correlation across the cluster</li>
+</ul>
 
-<p>My cluster runs on GKE with <strong>containerd</strong> runtime. Each node has a <code>node-monitor</code> DaemonSet that executes this script every 5 minutes. The dashboard at <code>monitor.internal</code> aggregates the snapshots.</p>
+<h2>Setup</h2>
+<pre><code>chmod +x health_check.sh
+./health_check.sh
+cat /tmp/k8s-health-*.json</code></pre>
 
-<h2>Why not Prometheus?</h2>
+<h2>Related Posts</h2>
+<ul>
+  <li><a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/">Debugging Kubernetes Clusters</a></li>
+  <li><a href="https://prometheus.io/docs/guides/node-exporter/">Prometheus Node Exporter Guide</a></li>
+  <li><a href="https://github.com/kubernetes/node-problem-detector">Node Problem Detector</a></li>
+</ul>
 
-<p>For a 3-node cluster running mostly batch jobs, the overhead isn't worth it. This script runs in <strong>~150ms</strong> and generates ~300 bytes of JSON per run. I've been using it for 8 months without issues.</p>
+</article>
 
-<h2>Setup &amp; Deployment</h2>
-
-<p>The script lives in <code>scripts/health_check.sh</code> in every cluster repo. Each environment sources a <code>cluster-config.env</code> file that customizes paths and retention settings. The DaemonSet spec is in <code>k8s/daemonset-health.yaml</code>.</p>
-
-<p>For a new node, the bootstrap sequence in <code>AGENTS.md</code> handles setup:</p>
-
-<ol>
-  <li>Clone the cluster-config repo</li>
-  <li>Source <code>cluster-config.env</code> to set <code>NODE_ROLE</code> and <code>LOG_PATH</code></li>
-  <li>Run <code>bash scripts/health_check.sh</code> once to verify</li>
-  <li>Apply the DaemonSet manifest</li>
-</ol>
-
-<p>If you find a bug, report it on <a href="#">GitHub issues</a>. I respond within a day usually.</p>
-
-<div class="footer">
-  © 2026 James McGill · Built with Hugo · <a href="#">RSS</a> · <a href="#">Twitter</a>
-</div>
-
+<footer>
+  <p>© 2026 opseng.dev — <a href="/about">About</a> • <a href="https://github.com/opseng">GitHub</a> • <a href="https://twitter.com/opseng">Twitter</a> • <a href="/rss.xml">RSS</a></p>
+</footer>
 </body>
 </html>
