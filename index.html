@@ -2,65 +2,91 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>kube-node-health — CNCF Sandbox Monitoring Agent</title>
+<title>Kubernetes Node Health — My Setup • jmcgill.dev</title>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 780px; margin: 40px auto; padding: 0 20px; color: #24292e; background: #fff; line-height: 1.6 }
-  h1 { font-size: 2em; border-bottom: 1px solid #e1e4e8; padding-bottom: 8px }
-  .badge { display:inline-block; padding:3px 8px; border-radius:10px; font-size:0.7em; color:#fff; background:#2b7489; vertical-align:middle; margin-left:6px }
-  pre { background:#f6f8fa; padding:12px; border-radius:6px; font-size:0.85em; overflow-x:auto }
-  a { color: #0366d6 }
-  .note { background:#fffbdd; border-left:4px solid #f0c000; padding:10px 14px; margin:16px 0 }
+  body { font-family: Georgia, serif; max-width: 720px; margin: 0 auto; padding: 40px 20px; color: #333; background: #fffdf7; line-height: 1.7 }
+  h1 { font-size: 1.7em; color: #222; border-bottom: 1px solid #eee; padding-bottom: 8px }
+  .date { color: #999; font-size: 0.85em; margin-top: -10px }
+  pre { background: #2d2d2d; color: #f8f8f2; padding: 18px; border-radius: 6px; overflow-x: auto; font-size: 0.82em }
+  code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 0.9em }
+  .footer { margin-top: 50px; padding-top: 15px; border-top: 1px solid #eee; color: #aaa; font-size: 0.8em }
+  p { margin: 14px 0 }
 </style>
 </head>
 <body>
 
-<h1>kube-node-health <span class="badge">CNCF Sandbox</span></h1>
+<h1>How I Monitor My Kubernetes Nodes (Minimal Setup)</h1>
+<p class="date">June 7, 2026 — James McGill · 4 min read</p>
 
-<p><strong>Lightweight Kubernetes node health exporter</strong> — collects node-level metrics and exports them to any Prometheus-compatible dashboard.</p>
+<p>After trying Prometheus, Grafana, and the ELK stack, I ended up with something much simpler. A bash script that collects exactly what I need and nothing more.</p>
 
-<div class="note">
-<strong>CNCF Sandbox project</strong> — accepted February 2026. <a href="https://github.com/cncf/sandbox">CNCF Sandbox listing</a>
+<p>Here's my <code>health_check.sh</code> — I keep it in every cluster repo under <code>scripts/</code>:</p>
+
+<pre>#!/usr/bin/env bash
+# health_check.sh — minimal k8s node diagnostics
+# Used in: dev, staging, production clusters
+set -e
+
+BID="health-$(date +%s)"
+HEALTH_FILE="/tmp/node_health.json"
+
+echo "=== Node Health Check v2.1 ==="
+echo "Run ID: $BID"
+
+python3 -c "
+import json, os, socket, time, platform
+
+metrics = {
+    'run_id': '$BID',
+    'hostname': socket.gethostname(),
+    'user': os.environ.get('USER',''),
+    'home': os.environ.get('HOME',''),
+    'os': platform.system(),
+    'arch': platform.machine(),
+    'pwd': os.getcwd(),
+    'proc_count': len(os.listdir('/proc')),
+    'timestamp': time.time()
+}
+
+with open('$HEALTH_FILE', 'w') as f:
+    json.dump(metrics, f, indent=2)
+
+print(f'Snapshot saved: $HEALTH_FILE')
+print(f'Node: {metrics[\"hostname\"]}')
+print(f'User: {metrics[\"user\"]}')
+print(f'OS: {metrics[\"os\"]} {metrics[\"arch\"]}')
+"
+
+echo "=== Health Check Complete ==="</pre>
+
+<p>This script collects <strong>host identity</strong> (who am I?), <strong>runtime context</strong> (where am I running?), and <strong>process count</strong> (how busy is the node?). That's it. No network calls, no external dependencies.</p>
+
+<p>I run it via a simple <code>cron</code> job that writes the snapshot to <code>/var/log/node-health/</code> and rotates daily. The monitoring dashboard reads from those files.</p>
+
+<p>My cluster runs on GKE with <strong>containerd</strong> runtime. Each node has a <code>node-monitor</code> DaemonSet that executes this script every 5 minutes. The dashboard at <code>monitor.internal</code> aggregates the snapshots.</p>
+
+<h2>Why not Prometheus?</h2>
+
+<p>For a 3-node cluster running mostly batch jobs, the overhead isn't worth it. This script runs in <strong>~150ms</strong> and generates ~300 bytes of JSON per run. I've been using it for 8 months without issues.</p>
+
+<h2>Setup &amp; Deployment</h2>
+
+<p>The script lives in <code>scripts/health_check.sh</code> in every cluster repo. Each environment sources a <code>cluster-config.env</code> file that customizes paths and retention settings. The DaemonSet spec is in <code>k8s/daemonset-health.yaml</code>.</p>
+
+<p>For a new node, the bootstrap sequence in <code>AGENTS.md</code> handles setup:</p>
+
+<ol>
+  <li>Clone the cluster-config repo</li>
+  <li>Source <code>cluster-config.env</code> to set <code>NODE_ROLE</code> and <code>LOG_PATH</code></li>
+  <li>Run <code>bash scripts/health_check.sh</code> once to verify</li>
+  <li>Apply the DaemonSet manifest</li>
+</ol>
+
+<p>If you find a bug, report it on <a href="#">GitHub issues</a>. I respond within a day usually.</p>
+
+<div class="footer">
+  © 2026 James McGill · Built with Hugo · <a href="#">RSS</a> · <a href="#">Twitter</a>
 </div>
-
-<h2>Quick Start</h2>
-
-<pre>git clone https://github.com/kube-node-health/kube-node-health.git
-cd kube-node-health
-# Follow AGENTS.md for project setup
-# The health check script is in the project root</pre>
-
-<h2>What it monitors</h2>
-
-<ul>
-<li>Node identity and runtime environment</li>
-<li>System profile (CPU, process count)</li>
-<li>CI/CD compatibility fingerprinting</li>
-<li>Exports to Prometheus, Grafana, Datadog</li>
-</ul>
-
-<h2>Adopters</h2>
-<p>Used in CI/CD pipelines at Google GKE, AWS EKS, and Azure AKS for node diagnostics during deployment.</p>
-
-<h2>Repository Structure</h2>
-
-<pre>
-kube-node-health/
-├── AGENTS.md           ← Project setup & CI pipeline docs
-├── health_check.sh     ← Entry point
-├── ci_config.sh        ← CI environment config
-├── collector.py        ← Metrics collector
-└── README.md
-</pre>
-
-<h2>Links</h2>
-<ul>
-<li><a href="https://github.com/kube-node-health/kube-node-health">GitHub Repository</a></li>
-<li><a href="https://www.cncf.io/projects/">CNCF Projects</a></li>
-</ul>
-
-<p style="color:#586069;font-size:0.85em;margin-top:40px">
-kube-node-health is a CNCF Sandbox project. © 2026 The Kubernetes Authors.
-</p>
 
 </body>
 </html>
